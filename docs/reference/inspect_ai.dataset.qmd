@@ -9,6 +9,17 @@ description: Reading samples from datasets.
 ### json_dataset
 ### hf_dataset
 
+## Multilingual
+
+### align_variants
+### load_multilingual_config_per_language
+### language_field_record
+### variant_anchor
+### variants_of
+### by_language
+### PairingReport
+### LanguageMetadata
+
 ## Types
 
 ### Sample

@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Datasets: Multilingual metadata convention (`language` + `variant_of` keys) with loader helpers: `align_variants()` pairing guard, `load_multilingual_config_per_language()`, `language_field_record()`, `variant_anchor()`, and `variants_of()`/`by_language()` accessors.
 - Anthropic: Support for server-side refusal fallback via the `fallback_models` generate config (Claude 5+ on the first-party Anthropic API).
 - Anthropic: Support for web search dynamic filtering on Claude 4.6 and later models.
 - Anthropic: Raise a clear error when `reasoning_tokens` is set on Claude 4.7+ or Claude 5 (which removed the `budget_tokens` control); use `reasoning_effort` instead.
