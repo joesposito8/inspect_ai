@@ -393,3 +393,143 @@ def test_loader_rejects_empty_languages() -> None:
             anchor_key=anchor_from_id,
             name_prefix="ds",
         )
+
+
+# FR-1: config/field name decoupled from the BCP 47 code stored in metadata
+
+
+def _fake_per_config(anchors: list[str]) -> Any:
+    def fake_hf_dataset(path: str, **kwargs: Any) -> MemoryDataset:
+        name = kwargs["name"]  # the HF config name, e.g. "FR_FR"
+        return MemoryDataset([sample_for(name, anchor) for anchor in anchors])
+
+    return fake_hf_dataset
+
+
+def test_loader_maps_config_names_to_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "inspect_ai.dataset._sources.multilingual.hf_dataset",
+        _fake_per_config(["q1", "q2"]),
+    )
+    dataset = load_multilingual_config_per_language(
+        path="org/mmmlu",
+        languages={"FR_FR": "fr", "DE_DE": "de"},  # config name -> BCP 47 code
+        record_to_sample=lambda record: Sample(input="unused"),
+        anchor_key=anchor_from_id,
+        name_prefix="mmmlu",
+        source_language="fr",
+    )
+    codes = {(s.metadata or {}).get("language") for s in dataset}
+    assert codes == {"fr", "de"}  # codes, not the "FR_FR"/"DE_DE" config names
+    assert dataset[0].id == "mmmlu:q1:fr"
+    meta0 = dataset[0].metadata
+    assert meta0 is not None
+    assert meta0["variant_of"] == "mmmlu:q1"
+
+
+def test_loader_source_language_checked_against_codes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "inspect_ai.dataset._sources.multilingual.hf_dataset",
+        _fake_per_config(["q1", "q2"]),
+    )
+    with caplog.at_level(logging.WARNING):
+        load_multilingual_config_per_language(
+            path="org/mmmlu",
+            languages={"FR_FR": "fr", "DE_DE": "de"},
+            record_to_sample=lambda record: Sample(input="unused"),
+            anchor_key=anchor_from_id,
+            name_prefix="mmmlu",
+            source_language="en",  # absent from the codes -> warns
+        )
+    assert "source language 'en'" in caplog.text
+    assert "'fr'" in caplog.text  # warning lists codes
+    assert "FR_FR" not in caplog.text  # not the config names
+
+
+def test_loader_source_language_none_no_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "inspect_ai.dataset._sources.multilingual.hf_dataset",
+        _fake_per_config(["q1", "q2"]),
+    )
+    with caplog.at_level(logging.WARNING):
+        dataset = load_multilingual_config_per_language(
+            path="org/ds",
+            languages=["de", "fr"],
+            record_to_sample=lambda record: Sample(input="unused"),
+            anchor_key=anchor_from_id,
+            name_prefix="ds",
+            source_language=None,
+        )
+    assert "source language" not in caplog.text
+    assert len(dataset) == 4
+
+
+def test_language_field_record_maps_codes() -> None:
+    mapper = language_field_record(
+        lambda record: Sample(input=str(record["prompt"])),
+        language_field="language",
+        languages={"arb": "ar", "yor": "yo"},  # ISO 639-3 -> BCP 47, doubles as filter
+        anchor_field="record_id",
+        name_prefix="aya",
+    )
+    records = [
+        {"prompt": "x", "language": "arb", "record_id": 1},
+        {"prompt": "y", "language": "yor", "record_id": 1},
+        {"prompt": "z", "language": "eng", "record_id": 1},  # not a key -> dropped
+    ]
+    samples = map_records(mapper, records)
+    assert len(samples) == 2
+    assert {(s.metadata or {}).get("language") for s in samples} == {"ar", "yo"}
+    assert {str(s.id) for s in samples} == {"aya:1:ar", "aya:1:yo"}
+
+
+# FR-8: the 0%-pairing error names the non-overlapping-slice cause, not only #668
+
+
+def test_zero_pairing_error_mentions_slice_cause() -> None:
+    # disjoint anchors per language (e.g. a limit slice of misordered configs):
+    # 0% pairing, but NOT a hashing bug
+    samples = [
+        sample_for("en", "q1"),
+        sample_for("en", "q2"),
+        sample_for("de", "q3"),
+        sample_for("de", "q4"),
+    ]
+    with pytest.raises(ValueError, match="row order"):
+        align_variants(samples, name_prefix="ds", anchor_key=anchor_from_id)
+
+
+# remaining coverage gaps
+
+
+def test_set_id_false_preserves_ids() -> None:
+    samples = parallel_samples(["en", "de"], ["q1"])
+    original_ids = [s.id for s in samples]
+    report = align_variants(
+        samples, name_prefix="ds", anchor_key=anchor_from_id, set_id=False
+    )
+    assert report.pairing_rate == 1.0
+    assert [s.id for s in samples] == original_ids  # ids untouched
+    for sample in samples:
+        assert sample.metadata is not None
+        assert sample.metadata["variant_of"] == "ds:q1"  # variant_of still set
+
+
+def test_variant_anchor_str_id_field_none_raises() -> None:
+    with pytest.raises(ValueError, match="empty anchor"):
+        variant_anchor({"sample_id": None}, id_field="sample_id")
+
+
+def test_min_pairing_rate_out_of_range_raises() -> None:
+    samples = parallel_samples(["en", "de"], ["q1"])
+    with pytest.raises(ValueError, match="min_pairing_rate must be in"):
+        align_variants(
+            samples,
+            name_prefix="ds",
+            anchor_key=anchor_from_id,
+            min_pairing_rate=1.5,
+        )

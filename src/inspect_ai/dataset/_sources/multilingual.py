@@ -1,5 +1,6 @@
 import logging
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Sequence
 
@@ -117,6 +118,12 @@ def align_variants(
     prioritized over recall throughout: a false pairing silently corrupts every
     paired statistic computed over it, while a missing pairing merely excludes an
     item — so failures are loud and pairings are never fabricated.
+
+    Clustered standard errors over the result — `stderr(cluster="variant_of")` —
+    are only valid when every sample is paired: unpaired samples all carry
+    `variant_of = None` and would otherwise collapse into a single spurious
+    cluster. On a partially-paired dataset, filter to the paired samples first, or
+    use `grouped(metric, group_key="language")` instead.
 
     This is the public guard: `load_multilingual_config_per_language()` calls it
     internally, and `language_field_record()` output or hand-rolled wide-shape
@@ -261,12 +268,17 @@ def align_variants(
     if paired_groups == 0 and len(report.languages) >= 2:
         raise ValueError(
             f"align_variants: 0% of {report.num_groups} anchor groups paired "
-            f"across {len(report.languages)} languages. This almost always means "
-            "anchor_key returns language-dependent values — e.g. an id hashed "
+            f"across {len(report.languages)} languages. Two common causes: "
+            "(1) anchor_key returns language-dependent values — e.g. an id hashed "
             "from translated sample text (the inspect_evals#668 bug) — so the "
-            "same question never shares an anchor across languages. Use a "
-            "language-invariant anchor: an explicit id shared across language "
-            "configs, a composite structural key, or (opt-in) the row index."
+            "same item never shares an anchor across languages; use a "
+            "language-invariant anchor (an explicit id shared across language "
+            "configs, a composite structural key, or the opt-in row index). "
+            "(2) The languages share no items because a different subset of rows "
+            "was loaded per language — e.g. a `limit` or sliced `split` applied to "
+            "configs that are not in the same row order, so each language loaded a "
+            "disjoint set; load the full configs (or otherwise align the slices) "
+            "before pairing."
         )
     if report.pairing_rate < min_pairing_rate:
         raise ValueError(
@@ -359,7 +371,7 @@ def variant_anchor(
 
 def load_multilingual_config_per_language(
     path: str,
-    languages: Sequence[str],
+    languages: Sequence[str] | Mapping[str, str],
     record_to_sample: RecordToSample,
     *,
     anchor_key: Callable[[Sample], str],
@@ -384,6 +396,17 @@ def load_multilingual_config_per_language(
     pass `auto_id=True` (positional ids are assigned per config before
     alignment) with `anchor_key=lambda s: str(s.id)` and leave `shuffle` off.
 
+    When a dataset's HF config names are not BCP 47 codes (MMMLU `"FR_FR"`,
+    Belebele `"eng_Latn"`), pass `languages` as a mapping from config name to the
+    code to record (`{"FR_FR": "fr", "DE_DE": "de"}`); the code is what lands in
+    `metadata["language"]` and what `grouped(group_key="language")` buckets on.
+
+    Do not pass `limit` (or a sliced `split` such as `"test[:100]"`) unless the
+    per-language configs share identical row order: Global-MMLU and MGSM do, but
+    others (e.g. Belebele) do not, so a slice loads disjoint rows per language and
+    pairing collapses (a confusing 0% guard failure). Load the full configs, then
+    filter by variant group if you need a subset.
+
     Example (Global-MMLU; `sample_id` is identical across its 42 configs):
 
     ```python
@@ -401,15 +424,19 @@ def load_multilingual_config_per_language(
 
     Args:
         path: Path or name of the Hugging Face dataset.
-        languages: Language configs to load (BCP 47 codes matching the
-            dataset's config names).
+        languages: Language configs to load. Either a sequence of HF config
+            names that are themselves BCP 47 codes (Global-MMLU
+            `["en", "de", "ar"]`), or a mapping from HF config name to the BCP 47
+            code to record when the two differ (MMMLU `{"FR_FR": "fr"}`, Belebele
+            `{"eng_Latn": "en"}`). The key is passed to `hf_dataset(name=...)`;
+            the value is stored in `metadata["language"]`.
         record_to_sample: Maps a raw record to a `Sample` (passed to
             `hf_dataset()` as `sample_fields`).
         anchor_key: Returns the language-invariant anchor for a constructed
             sample (e.g. `lambda s: str(s.id)`).
-        source_language: Informational source/reference language. When not
-            among `languages` a warning is logged (peer sets and source-absent
-            slices are legitimate); pairing is unaffected.
+        source_language: Informational source/reference language (a BCP 47 code).
+            When not among the loaded language codes a warning is logged (peer
+            sets and source-absent slices are legitimate); pairing is unaffected.
         split: Dataset split to load.
         name_prefix: Dataset namespace for `variant_of`/`id` (e.g.
             `"global_mmlu"`).
@@ -429,21 +456,31 @@ def load_multilingual_config_per_language(
     """
     if not languages:
         raise ValueError("load_multilingual_config_per_language: languages is empty.")
-    if source_language is not None and source_language not in languages:
+    # Normalize to (config_name, language_code) pairs: a mapping decouples the HF
+    # config name (passed to hf_dataset) from the BCP 47 code stored in metadata;
+    # a bare sequence uses each value as both.
+    config_pairs: list[tuple[str, str]]
+    if isinstance(languages, Mapping):
+        config_pairs = list(languages.items())
+    else:
+        config_pairs = [(language, language) for language in languages]
+    codes = [code for _, code in config_pairs]
+
+    if source_language is not None and source_language not in codes:
         logger.warning(
             "load_multilingual_config_per_language[%s]: source language %r is "
             "not among the loaded languages %s; pairing proceeds over a peer set.",
             name_prefix,
             source_language,
-            list(languages),
+            codes,
         )
 
     samples: list[Sample] = []
-    for language in languages:
+    for config_name, code in config_pairs:
         dataset = hf_dataset(
             path,
             split=split,
-            name=language,
+            name=config_name,
             revision=revision,
             sample_fields=record_to_sample,
             **hf_kwargs,
@@ -451,7 +488,7 @@ def load_multilingual_config_per_language(
         for sample in dataset:
             if sample.metadata is None:
                 sample.metadata = {}
-            sample.metadata["language"] = language
+            sample.metadata["language"] = code
             samples.append(sample)
 
     align_variants(
@@ -468,7 +505,7 @@ def language_field_record(
     record_to_sample_inner: RecordToSample,
     *,
     language_field: str,
-    languages: Sequence[str] | None = None,
+    languages: Sequence[str] | Mapping[str, str] | None = None,
     anchor_field: str | None = None,
     name_prefix: str = "",
 ) -> RecordToSample:
@@ -480,7 +517,9 @@ def language_field_record(
 
     1. Reads `record[language_field]`; when `languages` is set and the value is
        not in it, drops the record (returns `[]`).
-    2. Maps the record with the inner mapper and sets `metadata["language"]`.
+    2. Maps the record with the inner mapper and sets `metadata["language"]`
+       (normalized to the BCP 47 code via the `languages` mapping when one is
+       given — e.g. Aya's ISO 639-3 `language` column `{"arb": "ar"}`).
     3. When `anchor_field` names a language-invariant shared record id, sets
        `metadata["variant_of"] = f"{name_prefix}:{record[anchor_field]}"` and
        `id = f"{name_prefix}:{record[anchor_field]}:{language}"`. When
@@ -503,7 +542,10 @@ def language_field_record(
     Args:
         record_to_sample_inner: Inner mapper from record to `Sample`.
         language_field: Record field holding the language code.
-        languages: Languages to keep; `None` keeps all.
+        languages: Languages to keep. A sequence of raw `language_field` values
+            to keep (stored verbatim), or a mapping from raw value to the BCP 47
+            code to record when they differ (Aya `{"arb": "ar", "yor": "yo"}`);
+            `None` keeps all and stores the raw value.
         anchor_field: Record field holding a language-invariant shared record
             id; `None` emits `variant_of = None`.
         name_prefix: Dataset namespace; required when `anchor_field` is set.
@@ -525,9 +567,13 @@ def language_field_record(
         )
 
     def record_to_sample(record: DatasetRecord) -> list[Sample]:
-        language = str(record[language_field])
-        if languages is not None and language not in languages:
+        raw_language = str(record[language_field])
+        if languages is not None and raw_language not in languages:
             return []
+        # a mapping doubles as filter (keys) and normalizer (values -> BCP 47)
+        language = (
+            languages[raw_language] if isinstance(languages, Mapping) else raw_language
+        )
         result = record_to_sample_inner(record)
         result_samples = [result] if isinstance(result, Sample) else result
         if anchor_field is not None and len(result_samples) > 1:
